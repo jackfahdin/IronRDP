@@ -1,10 +1,9 @@
 use ironrdp_core::{WriteBuf, other_err};
 use ironrdp_pdu::{PduHint, nego};
-use picky::key::PrivateKey;
 use picky_asn1_x509::{Certificate, ExtensionView, GeneralName, oids};
 use sspi::credssp::{self, ClientState, CredSspClient};
 use sspi::generator::{Generator, NetworkRequest};
-use sspi::{Secret, Username};
+use sspi::Username;
 use tracing::debug;
 
 use crate::{
@@ -109,33 +108,9 @@ impl CredsspSequence {
                 }
                 .into()
             }
-            Credentials::SmartCard { pin, config } => match config {
-                Some(config) => {
-                    let cert: Certificate = picky_asn1_der::from_bytes(&config.certificate)
-                        .map_err(|_e| general_err!("can't parse certificate"))?;
-                    let key = PrivateKey::from_pkcs1(&config.private_key)
-                        .map_err(|_e| general_err!("can't parse private key"))?;
-                    let identity = sspi::SmartCardIdentity {
-                        username: extract_user_principal_name(&cert)
-                            .or_else(|| extract_user_name(&cert))
-                            .unwrap_or_default(),
-                        certificate: cert,
-                        reader_name: config.reader_name.clone(),
-                        card_name: None,
-                        container_name: Some(config.container_name.clone()),
-                        csp_name: config.csp_name.clone(),
-                        pin: pin.as_bytes().to_vec().into(),
-                        private_key: Some(key.into()),
-                        scard_type: sspi::SmartCardType::Emulated {
-                            scard_pin: Secret::new(pin.as_bytes().to_vec()),
-                        },
-                    };
-                    sspi::Credentials::SmartCard(Box::new(identity))
-                }
-                None => {
-                    return Err(general_err!("smart card configuration missing"));
-                }
-            },
+            Credentials::SmartCard { .. } => {
+                return Err(general_err!("smart card authentication is disabled in NyaTerm"));
+            }
         };
 
         let server_name = server_name.into_inner();
@@ -241,10 +216,12 @@ impl CredsspSequence {
     }
 }
 
+#[expect(dead_code, reason = "kept for restoring the smart card credential path")]
 fn extract_user_name(cert: &Certificate) -> Option<String> {
     cert.tbs_certificate.subject.find_common_name().map(ToString::to_string)
 }
 
+#[expect(dead_code, reason = "kept for restoring the smart card credential path")]
 fn extract_user_principal_name(cert: &Certificate) -> Option<String> {
     cert.extensions()
         .iter()
