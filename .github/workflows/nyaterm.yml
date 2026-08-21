@@ -1,0 +1,45 @@
+name: NyaTerm branch
+
+# Upstream's ci.yml only triggers on `master`, so nothing ran on this branch.
+# Only the two patched crates are built; the rest of the workspace is upstream's
+# concern and needs system dependencies this job has no reason to install.
+#
+# Triggers on this branch only, and lives in its own file rather than editing
+# upstream's workflow, so rebasing the patch series onto a newer upstream never
+# conflicts over CI configuration.
+
+on:
+  push:
+    branches: ["nyaterm"]
+  pull_request:
+    branches: ["nyaterm"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: check and test the patched crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ironrdp-client
+        run: cargo check -p ironrdp-client --features rustls
+
+      - name: Check ironrdp-client (with clipboard)
+        run: cargo check -p ironrdp-client --features rustls,clipboard
+
+      - name: Check ironrdp-connector
+        run: cargo check -p ironrdp-connector
+
+      - name: Test ironrdp-connector
+        run: cargo test -p ironrdp-connector
+
+# Both client feature sets are checked on purpose: `warn` is imported only under
+# `clipboard`, so a bare `warn!` in always-compiled code builds one way and not
+# the other.
+#
+# `-D warnings` is deliberately not used: the workspace's clippy.toml and
+# Cargo.toml disagree on the MSRV, which upstream warns about once per crate.
