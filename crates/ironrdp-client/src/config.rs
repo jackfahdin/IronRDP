@@ -109,6 +109,8 @@ pub struct Config {
     pub(crate) rail_client_status_flags: Option<u32>,
     /// Initial RemoteApp launch queued after the RAIL handshake.
     pub(crate) rail_initial_execute: Option<ExecutePdu>,
+    /// Report graphics updates as invalidated rectangles instead of whole frames.
+    pub(crate) dirty_region_updates: bool,
 
     /// DVC channel ↔ named-pipe proxy configuration.
     ///
@@ -253,6 +255,7 @@ impl fmt::Debug for Config {
         #[cfg(any(feature = "sound", feature = "rdpdr"))]
         s.field("audio_quality_mode", &self.audio_quality_mode);
         s.field("rail_client_status_flags", &self.rail_client_status_flags);
+        s.field("dirty_region_updates", &self.dirty_region_updates);
         #[cfg(feature = "dvc-pipe-proxy")]
         s.field("dvc_pipe_proxies", &self.dvc_pipe_proxies);
         #[cfg(all(windows, feature = "dvc-com-plugin"))]
@@ -727,6 +730,7 @@ pub struct ConfigBuilder {
     remote_application_program: Option<String>,
     rail_support_level: Option<ironrdp_pdu::rdp::capability_sets::RailSupportLevel>,
     rail_client_status_flags: Option<u32>,
+    dirty_region_updates: Option<bool>,
 
     transport: TransportKind,
     #[cfg(feature = "vmconnect")]
@@ -1048,6 +1052,30 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_rail_client_status_flags(mut self, flags: u32) -> Self {
         self.rail_client_status_flags = Some(flags);
+        self
+    }
+
+    /// Report graphics updates as the rectangles the server invalidated
+    /// ([`RdpOutputEvent::ImageRegion`]) instead of whole repacked frames
+    /// ([`RdpOutputEvent::Image`]).
+    ///
+    /// A consumer that uploads to a texture can then upload only the damaged
+    /// rectangle, instead of paying a full-desktop allocation and pixel repack for
+    /// every update — on a 4K session, a blinking cursor otherwise costs both.
+    /// Because region updates are not self-describing, enabling this also makes
+    /// framebuffer identity explicit: [`RdpOutputEvent::DesktopReset`] announces
+    /// each newly allocated framebuffer, a full [`RdpOutputEvent::ImageRegion`]
+    /// follows it, and [`RdpInputEvent::RequestFullFrame`] asks for another one.
+    ///
+    /// Off by default, so a consumer written against `Image` is unaffected.
+    ///
+    /// [`RdpOutputEvent::ImageRegion`]: crate::rdp::RdpOutputEvent::ImageRegion
+    /// [`RdpOutputEvent::Image`]: crate::rdp::RdpOutputEvent::Image
+    /// [`RdpOutputEvent::DesktopReset`]: crate::rdp::RdpOutputEvent::DesktopReset
+    /// [`RdpInputEvent::RequestFullFrame`]: crate::rdp::RdpInputEvent::RequestFullFrame
+    #[must_use]
+    pub fn with_dirty_region_updates(mut self, enabled: bool) -> Self {
+        self.dirty_region_updates = Some(enabled);
         self
     }
 
@@ -1829,6 +1857,7 @@ impl ConfigBuilder {
             audio_quality_mode: self.audio_quality_mode.unwrap_or_default(),
             rail_client_status_flags: self.rail_client_status_flags,
             rail_initial_execute,
+            dirty_region_updates: self.dirty_region_updates.unwrap_or(false),
             #[cfg(feature = "dvc-pipe-proxy")]
             dvc_pipe_proxies: self.dvc_pipe_proxies,
             #[cfg(all(windows, feature = "dvc-com-plugin"))]

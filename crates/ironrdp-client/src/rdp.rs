@@ -107,6 +107,35 @@ pub enum RdpOutputEvent {
         width: NonZeroU16,
         height: NonZeroU16,
     },
+    /// A newly allocated framebuffer and its dimensions, emitted when the session
+    /// starts and again after a Deactivation-Reactivation Sequence replaces it.
+    ///
+    /// Only sent when [`with_dirty_region_updates`] is enabled. Region updates are
+    /// not self-describing, so without this a consumer cannot tell a resize from an
+    /// update.
+    ///
+    /// [`with_dirty_region_updates`]: crate::config::ConfigBuilder::with_dirty_region_updates
+    DesktopReset {
+        width: u16,
+        height: u16,
+    },
+    /// The rectangle the server invalidated, in the framebuffer's own byte layout.
+    ///
+    /// Only sent when [`with_dirty_region_updates`] is enabled, in place of
+    /// [`Self::Image`]. `full` marks a complete frame: one follows every
+    /// [`Self::DesktopReset`], and another is produced on demand by
+    /// [`RdpInputEvent::RequestFullFrame`].
+    ///
+    /// [`with_dirty_region_updates`]: crate::config::ConfigBuilder::with_dirty_region_updates
+    ImageRegion {
+        buffer: Vec<u8>,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        stride: usize,
+        full: bool,
+    },
     ConnectionFailure(ironrdp_connector::ConnectorError),
     PointerDefault,
     PointerHidden,
@@ -203,6 +232,13 @@ pub enum RdpInputEvent {
         contact_id: u8,
     },
     Close,
+    /// Asks for a full [`RdpOutputEvent::ImageRegion`], for a consumer that has lost
+    /// its own surface and needs to resynchronise.
+    ///
+    /// Ignored unless [`with_dirty_region_updates`] is enabled.
+    ///
+    /// [`with_dirty_region_updates`]: crate::config::ConfigBuilder::with_dirty_region_updates
+    RequestFullFrame,
     #[cfg(feature = "clipboard")]
     Clipboard(ClipboardMessage),
     SendDvcMessages {
@@ -784,6 +820,7 @@ impl RdpClient {
                 &mut self.close_receiver,
                 &mut self.graceful_close_receiver,
                 self.config.fake_events_interval,
+                self.config.dirty_region_updates,
                 &mut auto_reconnect_cookie,
                 &mut reconnect_attempt,
             )
@@ -995,6 +1032,51 @@ async fn send_active_output_event(
     send_cancellable_output_event(output_event_sender, event, close_receiver)
         .await
         .map_err(|error| ironrdp_session::custom_err!("output_event_sender", error))
+}
+
+/// Announces a freshly allocated framebuffer, then sends its whole contents, so a
+/// consumer of region updates starts from a known state.
+async fn send_desktop_reset(
+    output_event_sender: &mpsc::Sender<RdpOutputEvent>,
+    image: &DecodedImage,
+    close_receiver: &mut watch::Receiver<bool>,
+) -> SessionResult<bool> {
+    if !send_active_output_event(
+        output_event_sender,
+        RdpOutputEvent::DesktopReset {
+            width: image.width(),
+            height: image.height(),
+        },
+        close_receiver,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+
+    send_full_frame(output_event_sender, image, close_receiver).await
+}
+
+/// Sends the entire framebuffer as one `full` region update.
+async fn send_full_frame(
+    output_event_sender: &mpsc::Sender<RdpOutputEvent>,
+    image: &DecodedImage,
+    close_receiver: &mut watch::Receiver<bool>,
+) -> SessionResult<bool> {
+    send_active_output_event(
+        output_event_sender,
+        RdpOutputEvent::ImageRegion {
+            buffer: image.data().to_vec(),
+            x: 0,
+            y: 0,
+            width: image.width(),
+            height: image.height(),
+            stride: image.stride(),
+            full: true,
+        },
+        close_receiver,
+    )
+    .await
 }
 
 // ── Connector builder ─────────────────────────────────────────────────────────
@@ -2174,6 +2256,7 @@ async fn active_session(
     close_receiver: &mut watch::Receiver<bool>,
     graceful_close_receiver: &mut watch::Receiver<bool>,
     fake_events_interval: Option<Duration>,
+    dirty_region_updates: bool,
     auto_reconnect_cookie: &mut Option<ServerAutoReconnect>,
     reconnect_attempt: &mut u32,
 ) -> SessionResult<RdpControlFlow> {
@@ -2183,6 +2266,11 @@ async fn active_session(
     let mut suppress_output_support = connection_result.suppress_output_support;
     let window_support_level = connection_result.window_support_level;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+    if dirty_region_updates && !send_desktop_reset(output_event_sender, &image, close_receiver).await? {
+        return Ok(RdpControlFlow::TerminatedGracefully(
+            GracefulDisconnectReason::UserInitiated,
+        ));
+    }
 
     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
     let activation_factory = connection_result.activation_factory;
@@ -2467,6 +2555,16 @@ async fn active_session(
                         }
                     }
                     RdpInputEvent::Close => active_stage.graceful_shutdown()?,
+                    RdpInputEvent::RequestFullFrame => {
+                        if dirty_region_updates
+                            && !send_full_frame(output_event_sender, &image, close_receiver).await?
+                        {
+                            return Ok(RdpControlFlow::TerminatedGracefully(
+                                GracefulDisconnectReason::UserInitiated,
+                            ));
+                        }
+                        Vec::new()
+                    }
                     #[cfg(feature = "clipboard")]
                     RdpInputEvent::Clipboard(event) => {
                         process_clipboard_message(&mut active_stage, event)?
@@ -2695,30 +2793,37 @@ async fn active_session(
                         )));
                     }
                 }
-                ActiveStageOutput::GraphicsUpdate(_region) => {
-                    let buffer: Vec<u32> = image
-                        .data()
-                        .chunks_exact(4)
-                        .map(|pixel| {
-                            let r = pixel[0];
-                            let g = pixel[1];
-                            let b = pixel[2];
-                            u32::from_be_bytes([0, r, g, b])
-                        })
-                        .collect();
-                    if !send_active_output_event(
-                        output_event_sender,
+                ActiveStageOutput::GraphicsUpdate(region) => {
+                    let event = if dirty_region_updates {
+                        RdpOutputEvent::ImageRegion {
+                            buffer: image.data_for_rect(&region).to_vec(),
+                            x: region.left,
+                            y: region.top,
+                            width: region.right.saturating_sub(region.left).saturating_add(1),
+                            height: region.bottom.saturating_sub(region.top).saturating_add(1),
+                            stride: image.stride(),
+                            full: false,
+                        }
+                    } else {
+                        let buffer: Vec<u32> = image
+                            .data()
+                            .chunks_exact(4)
+                            .map(|pixel| {
+                                let r = pixel[0];
+                                let g = pixel[1];
+                                let b = pixel[2];
+                                u32::from_be_bytes([0, r, g, b])
+                            })
+                            .collect();
                         RdpOutputEvent::Image {
                             buffer,
                             width: NonZeroU16::new(image.width())
                                 .ok_or_else(|| ironrdp_session::general_err!("width is zero"))?,
                             height: NonZeroU16::new(image.height())
                                 .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?,
-                        },
-                        close_receiver,
-                    )
-                    .await?
-                    {
+                        }
+                    };
+                    if !send_active_output_event(output_event_sender, event, close_receiver).await? {
                         return Ok(RdpControlFlow::TerminatedGracefully(
                             GracefulDisconnectReason::UserInitiated,
                         ));
@@ -2928,6 +3033,13 @@ async fn active_session(
                         {
                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                            if dirty_region_updates
+                                && !send_desktop_reset(output_event_sender, &image, close_receiver).await?
+                            {
+                                return Ok(RdpControlFlow::TerminatedGracefully(
+                                    GracefulDisconnectReason::UserInitiated,
+                                ));
+                            }
                             resize_queue.completed();
                             if !active_stage.reactivate(
                                 connection_activation.io_channel_id(),
