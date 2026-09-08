@@ -90,3 +90,14 @@ Both client feature sets are checked because `warn` is imported only under
 
 A real RDP session against a Windows host — connect, resize, clipboard, and
 certificate prompt — is not covered by any of the above and remains a manual step.
+
+
+## Authenticated loopback route for remote-desktop network parity
+
+`ConfigBuilder::with_direct_tcp_proxy` redirects only the direct TCP connection,
+then sends a bounded authentication preamble. The original destination continues
+to drive TLS and CredSSP identity; the relay address is never substituted there.
+Only loopback endpoints are accepted. Authentication bytes are omitted from Debug.
+This patch is based on c44dcc77, which also merges upstream gateway authentication
+8649c7c6 after NyaTerm's previously pinned 75d9a3b3.
+Validation: Windows client build with rustls + clipboard; focused identity test.

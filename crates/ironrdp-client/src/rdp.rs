@@ -1572,10 +1572,21 @@ async fn connect_direct(
     rdpdr_factory: RdpdrFactoryRef<'_>,
     auto_reconnect_cookie: Option<&ServerAutoReconnect>,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
-    let dest = config.destination.to_string();
-    let stream = TcpStream::connect(&dest)
+    let dest = config
+        .direct_tcp_proxy
+        .as_ref()
+        .map(|proxy| proxy.address.to_string())
+        .unwrap_or_else(|| config.destination.to_string());
+    let mut stream = TcpStream::connect(&dest)
         .await
         .map_err(|e| ironrdp_connector::custom_err!("TCP connect", e))?;
+    if let Some(proxy) = &config.direct_tcp_proxy {
+        use tokio::io::AsyncWriteExt as _;
+        stream
+            .write_all(&proxy.authentication)
+            .await
+            .map_err(|e| ironrdp_connector::custom_err!("TCP proxy authentication", e))?;
+    }
     #[cfg(feature = "vmconnect")]
     let pcb_deadline = tokio::time::Instant::now() + ironrdp_vmconnect::PCB_TRANSMIT_DEADLINE;
     let client_addr = stream
