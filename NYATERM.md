@@ -5,10 +5,12 @@ to `ironrdp-client` and `ironrdp-connector` on top of an unmodified upstream bas
 
 - Fork: <https://github.com/nyakang/IronRDP>
 - Upstream: <https://github.com/Devolutions/IronRDP>
-- Base revision: `14ef4fd49f` (upstream `master`)
+- Base revision: `b149f500b85124c513646494335fb6cee525d897`
+  (upstream `master` on 2026-09-22)
 - Branch: `nyaterm`
-- Crates touched: `crates/ironrdp-client`, `crates/ironrdp-connector`. Nothing
-  else in the workspace is modified.
+- Crates touched: `crates/ironrdp-client`, `crates/ironrdp-connector`,
+  `crates/ironrdp-acceptor`, `crates/ironrdp-vmconnect`, `crates/ironrdp-mstsgu`,
+  `crates/ironrdp`, and `ffi`.
 
 NyaTerm consumes both through `[patch.crates-io]`. The crate versions this base
 publishes are unchanged from the 0.1.0 / 0.10.0 release commit the branch used to
@@ -16,19 +18,23 @@ sit on, so those pinned slots still resolve.
 
 ## Patches
 
-1. `feat(client): emit dirty-region graphics updates and explicit desktop resets`
-   — `RdpOutputEvent::ImageRegion` forwards the invalidated rectangle instead of
-   reallocating and repacking the whole framebuffer per update; `DesktopReset`
-   makes framebuffer identity explicit, and `RdpInputEvent::RequestFullFrame`
-   lets a consumer resynchronise. Opt-in through
-   `ConfigBuilder::with_dirty_region_updates`, so `ironrdp-viewer`,
-   `ironrdp-daemon` and `ironrdp-activex`, which all match on
-   `RdpOutputEvent::Image`, are unaffected.
+1. `feat(client): request a full desktop update on demand` — upstream now owns
+   `DesktopUpdate` delivery and `RdpClient::with_desktop_updates()`. NyaTerm keeps
+   only `RdpInputEvent::RequestFullFrame`, which emits a full-frame
+   `DesktopUpdate` through the same ordered output channel for resynchronisation.
 2. `refactor(connector): drop the picky dependency and the smart-card path` —
    removes an unused-feature dependency whose defaults pin a prerelease
    `aes-gcm`, and whose `=7.0.0-rc.25` pin also conflicts outright with the
    `=7.0.0-rc.26` that `sspi` pins. **Deliberately drops smart-card
    authentication and redirection**; username/password NLA is unaffected.
+3. `feat(client): support authenticated loopback TCP routes` — direct TCP may
+   connect through a validated loopback relay and send a bounded authentication
+   preamble while retaining the original destination for TLS and CredSSP
+   identity. UDP is disabled for relayed connections because the relay contract
+   covers TCP only.
+4. `build: consume SSPI 0.22` — all direct SSPI dependencies use 0.22, gateway
+   picky resolves at rc.26, and fallible `TsRequest::buffer_len` calls propagate
+   encoding errors in connector, acceptor, and VMConnect paths.
 
 ## Not carried here
 
@@ -65,13 +71,12 @@ upstream now covers what they did:
   crates as a git dependency, so cargo caps their lints, and this branch's CI
   does not use `-D warnings`.
 
-## Deviation from the previous shape of patch 1
+## Removed local graphics API
 
-The earlier version of the dirty-region patch replaced `RdpOutputEvent::Image`
-outright. That was tenable when `ironrdp-viewer` was the only other consumer; the
-workspace now also has `ironrdp-daemon` and `ironrdp-activex` matching on it, so
-the behaviour is a config flag instead and the variant stays. This also makes the
-patch shaped like something upstream could take.
+The 2026-09-22 merge drops the fork-only `DesktopReset`, `ImageRegion`,
+`ConfigBuilder::with_dirty_region_updates`, and its duplicate framebuffer state.
+Upstream's `DesktopUpdate` carries the framebuffer extent and inclusive changed
+region, and sends a full update whenever the extent changes.
 
 ## Validation
 
@@ -81,9 +86,15 @@ On Windows 11, with the toolchain `rust-toolchain.toml` pins (1.94.1):
 cargo check -p ironrdp-client --features rustls            # clean
 cargo check -p ironrdp-client --features rustls,clipboard  # clean
 cargo check -p ironrdp-connector                           # clean
+cargo check -p ironrdp-acceptor                            # clean
+cargo check -p ironrdp-vmconnect                           # clean
 cargo test -p ironrdp-connector                            # clean
 cargo clippy -p ironrdp-client --features rustls           # no new warnings vs base
 ```
+
+The merge conflict was limited to `crates/ironrdp-client/src/rdp.rs`. The
+resolution retained upstream input batching, keepalive, UDP `ConnectOutput`, and
+desktop-damage coalescing while reapplying the relay and full-frame request.
 
 Both client feature sets are checked because `warn` is imported only under
 `clipboard` while some always-compiled code uses it.

@@ -1,9 +1,9 @@
 use ironrdp_core::{WriteBuf, other_err};
 use ironrdp_pdu::{PduHint, nego};
 use picky_asn1_x509::{Certificate, ExtensionView, GeneralName, oids};
+use sspi::Username;
 use sspi::credssp::{self, ClientState, CredSspClient};
 use sspi::generator::{Generator, NetworkRequest};
-use sspi::Username;
 use tracing::debug;
 
 use crate::{
@@ -239,7 +239,11 @@ fn extract_user_principal_name(cert: &Certificate) -> Option<String> {
 }
 
 fn write_credssp_request(ts_request: credssp::TsRequest, output: &mut WriteBuf) -> ConnectorResult<usize> {
-    let length = usize::from(ts_request.buffer_len());
+    let length = usize::from(
+        ts_request
+            .buffer_len()
+            .map_err(|e| custom_err!("TsRequest length", e))?,
+    );
 
     let unfilled_buffer = output.unfilled_to(length);
 

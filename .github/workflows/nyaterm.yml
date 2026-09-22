@@ -34,6 +34,12 @@ jobs:
       - name: Check ironrdp-connector
         run: cargo check -p ironrdp-connector
 
+      - name: Check ironrdp-acceptor
+        run: cargo check -p ironrdp-acceptor
+
+      - name: Check ironrdp-vmconnect
+        run: cargo check -p ironrdp-vmconnect
+
       - name: Test ironrdp-connector
         run: cargo test -p ironrdp-connector
 

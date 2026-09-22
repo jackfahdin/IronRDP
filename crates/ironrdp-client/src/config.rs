@@ -92,6 +92,8 @@ pub struct Config {
     pub(crate) connector: ironrdp_connector::Config,
     pub(crate) destination: Destination,
     pub(crate) transport: Transport,
+    #[cfg(feature = "udp")]
+    pub(crate) udp_transport_enabled: bool,
     pub(crate) certificate_validation: ironrdp_tls::CertificateValidation,
     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
 
@@ -100,7 +102,11 @@ pub struct Config {
     pub(crate) vm_id: Option<String>,
     #[cfg(feature = "vmconnect")]
     pub(crate) vmconnect_mode: VmConnectMode,
+    #[cfg(all(windows, feature = "vmconnect"))]
+    pub(crate) vmconnect_current_user: bool,
     pub(crate) kerberos_config: Option<ironrdp_connector::credssp::KerberosConfig>,
+    pub(crate) input_send_interval: Option<Duration>,
+    pub(crate) input_keepalive_interval: Option<Duration>,
     pub(crate) fake_events_interval: Option<Duration>,
     pub(crate) channels: ChannelConfig,
     pub(crate) administrative_session: bool,
@@ -110,8 +116,6 @@ pub struct Config {
     pub(crate) rail_client_status_flags: Option<u32>,
     /// Initial RemoteApp launch queued after the RAIL handshake.
     pub(crate) rail_initial_execute: Option<ExecutePdu>,
-    /// Report graphics updates as invalidated rectangles instead of whole frames.
-    pub(crate) dirty_region_updates: bool,
 
     /// DVC channel ↔ named-pipe proxy configuration.
     ///
@@ -155,6 +159,12 @@ impl Config {
         &self.transport
     }
 
+    /// Whether reliable RDP-UDP2 is enabled for eligible direct connections.
+    #[cfg(feature = "udp")]
+    pub fn udp_transport_enabled(&self) -> bool {
+        self.udp_transport_enabled
+    }
+
     /// TLS peer-certificate validation policy.
     pub fn certificate_validation(&self) -> ironrdp_tls::CertificateValidation {
         self.certificate_validation
@@ -177,9 +187,33 @@ impl Config {
         self.vm_id.as_ref().map(|_| self.vmconnect_mode)
     }
 
+    #[cfg(all(windows, feature = "vmconnect"))]
+    /// Whether VMConnect host authentication uses the caller's current Windows logon token.
+    pub fn vmconnect_current_user(&self) -> bool {
+        self.vm_id.is_some() && self.vmconnect_current_user
+    }
+
+    #[cfg(all(windows, feature = "vmconnect"))]
+    /// Whether this local VMConnect session accepts Hyper-V frame-buffer redirection.
+    pub fn vmconnect_framebuffer_redirection(&self) -> bool {
+        self.vm_id.is_some()
+            && matches!(&self.transport, Transport::Direct)
+            && is_loopback_host(self.destination.name())
+    }
+
     /// Optional Kerberos/KDC proxy configuration.
     pub fn kerberos_config(&self) -> Option<&ironrdp_connector::credssp::KerberosConfig> {
         self.kerberos_config.as_ref()
+    }
+
+    /// Minimum interval between non-forced input batches.
+    pub fn input_send_interval(&self) -> Option<Duration> {
+        self.input_send_interval
+    }
+
+    /// Interval between synthetic input keepalive events.
+    pub fn input_keepalive_interval(&self) -> Option<Duration> {
+        self.input_keepalive_interval
     }
 
     /// Idle anti-lock fake-events interval, if enabled.
@@ -238,6 +272,8 @@ impl fmt::Debug for Config {
         s.field("connector", &self.connector);
         s.field("destination", &self.destination);
         s.field("transport", &self.transport);
+        #[cfg(feature = "udp")]
+        s.field("udp_transport_enabled", &self.udp_transport_enabled);
         s.field("certificate_validation", &self.certificate_validation);
         s.field(
             "certificate_validation_callback",
@@ -247,8 +283,17 @@ impl fmt::Debug for Config {
         {
             s.field("vm_id", &self.vm_id);
             s.field("vmconnect_mode", &self.vmconnect_mode);
+            #[cfg(windows)]
+            s.field("vmconnect_current_user", &self.vmconnect_current_user);
+            #[cfg(windows)]
+            s.field(
+                "vmconnect_framebuffer_redirection",
+                &self.vmconnect_framebuffer_redirection(),
+            );
         }
         s.field("kerberos_config", &self.kerberos_config);
+        s.field("input_send_interval", &self.input_send_interval);
+        s.field("input_keepalive_interval", &self.input_keepalive_interval);
         s.field("fake_events_interval", &self.fake_events_interval);
         s.field("channels", &self.channels);
         s.field("administrative_session", &self.administrative_session);
@@ -256,7 +301,6 @@ impl fmt::Debug for Config {
         #[cfg(any(feature = "sound", feature = "rdpdr"))]
         s.field("audio_quality_mode", &self.audio_quality_mode);
         s.field("rail_client_status_flags", &self.rail_client_status_flags);
-        s.field("dirty_region_updates", &self.dirty_region_updates);
         #[cfg(feature = "dvc-pipe-proxy")]
         s.field("dvc_pipe_proxies", &self.dvc_pipe_proxies);
         #[cfg(all(windows, feature = "dvc-com-plugin"))]
@@ -327,6 +371,10 @@ pub struct ChannelConfig {
     /// Enable native MS-RDPEWA WebAuthn redirection.
     #[cfg(feature = "webauthn")]
     pub webauthn: bool,
+
+    /// Enable the MS-RDPEL location dynamic virtual channel.
+    #[cfg(feature = "location")]
+    pub location: bool,
 }
 
 #[cfg_attr(
@@ -359,6 +407,8 @@ impl Default for ChannelConfig {
             qoiz: true,
             #[cfg(feature = "webauthn")]
             webauthn: true,
+            #[cfg(feature = "location")]
+            location: false,
         }
     }
 }
@@ -732,15 +782,20 @@ pub struct ConfigBuilder {
     remote_application_program: Option<String>,
     rail_support_level: Option<ironrdp_pdu::rdp::capability_sets::RailSupportLevel>,
     rail_client_status_flags: Option<u32>,
-    dirty_region_updates: Option<bool>,
 
     transport: TransportKind,
+    #[cfg(feature = "udp")]
+    udp_transport_enabled: bool,
     #[cfg(feature = "vmconnect")]
     vm_id: Option<String>,
     #[cfg(feature = "vmconnect")]
     vmconnect_mode: VmConnectMode,
+    #[cfg(all(windows, feature = "vmconnect"))]
+    vmconnect_current_user: bool,
     rdcleanpath_token: Option<String>,
     kerberos_config: Option<ironrdp_connector::credssp::KerberosConfig>,
+    input_send_interval: Option<Duration>,
+    input_keepalive_interval: Option<Duration>,
     fake_events_interval: Option<Duration>,
     channels: ChannelConfig,
     #[cfg(any(feature = "sound", feature = "rdpdr"))]
@@ -1066,30 +1121,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Report graphics updates as the rectangles the server invalidated
-    /// ([`RdpOutputEvent::ImageRegion`]) instead of whole repacked frames
-    /// ([`RdpOutputEvent::Image`]).
-    ///
-    /// A consumer that uploads to a texture can then upload only the damaged
-    /// rectangle, instead of paying a full-desktop allocation and pixel repack for
-    /// every update — on a 4K session, a blinking cursor otherwise costs both.
-    /// Because region updates are not self-describing, enabling this also makes
-    /// framebuffer identity explicit: [`RdpOutputEvent::DesktopReset`] announces
-    /// each newly allocated framebuffer, a full [`RdpOutputEvent::ImageRegion`]
-    /// follows it, and [`RdpInputEvent::RequestFullFrame`] asks for another one.
-    ///
-    /// Off by default, so a consumer written against `Image` is unaffected.
-    ///
-    /// [`RdpOutputEvent::ImageRegion`]: crate::rdp::RdpOutputEvent::ImageRegion
-    /// [`RdpOutputEvent::Image`]: crate::rdp::RdpOutputEvent::Image
-    /// [`RdpOutputEvent::DesktopReset`]: crate::rdp::RdpOutputEvent::DesktopReset
-    /// [`RdpInputEvent::RequestFullFrame`]: crate::rdp::RdpInputEvent::RequestFullFrame
-    #[must_use]
-    pub fn with_dirty_region_updates(mut self, enabled: bool) -> Self {
-        self.dirty_region_updates = Some(enabled);
-        self
-    }
-
     /// Enable or disable TLS + Graphical login (legacy security protocol; also called SSL). Upserts
     /// the `ironrdp_tls` property.
     ///
@@ -1250,7 +1281,17 @@ impl ConfigBuilder {
         self
     }
 
-    #[cfg(feature = "vmconnect")]
+    /// Enables reliable RDP-UDP2 for eligible direct connections.
+    ///
+    /// Unsupported carriers remain TCP-only, and a failed UDP bootstrap falls
+    /// back to the main TCP connection.
+    #[cfg(feature = "udp")]
+    #[must_use]
+    pub fn with_udp_transport(mut self, enabled: bool) -> Self {
+        self.udp_transport_enabled = enabled;
+        self
+    }
+
     /// Connect to a Hyper-V VM console by VM GUID. Destination must use port
     /// [`ironrdp_vmconnect::PORT`] (2179) unless the caller explicitly selects another port.
     /// A destination with no explicit port defaults to 2179 instead of the ordinary RDP port.
@@ -1259,20 +1300,39 @@ impl ConfigBuilder {
     /// embedder (error if disabled). Works over Direct, RDCleanPath, and RDS Gateway (the
     /// destination port, typically 2179, is forwarded in the MS-TSGU channel-create packet,
     /// then the VMConnect PCB / `connect_front` handshake runs on the tunneled stream).
+    #[cfg(feature = "vmconnect")]
     #[must_use]
     pub fn with_vmconnect(mut self, vm_id: impl Into<String>) -> Self {
-        self.vm_id = Some(vm_id.into());
+        let vm_id = vm_id.into();
+        self.properties.set_vmconnect_id(vm_id.clone());
+        self.properties.set_vmconnect_basic(false);
+        self.vm_id = Some(vm_id);
+        self.vmconnect_mode = VmConnectMode::Enhanced;
         self
     }
 
-    #[cfg(feature = "vmconnect")]
     /// Connect to a Hyper-V VM console using the selected mode.
     ///
     /// See [`with_vmconnect`](Self::with_vmconnect) for transport notes.
+    #[cfg(feature = "vmconnect")]
     #[must_use]
     pub fn with_vmconnect_mode(mut self, vm_id: impl Into<String>, mode: VmConnectMode) -> Self {
-        self.vm_id = Some(vm_id.into());
+        let vm_id = vm_id.into();
+        self.properties.set_vmconnect_id(vm_id.clone());
+        self.properties.set_vmconnect_basic(mode == VmConnectMode::Basic);
+        self.vm_id = Some(vm_id);
         self.vmconnect_mode = mode;
+        self
+    }
+
+    /// Use the caller's current Windows logon token for VMConnect host authentication.
+    ///
+    /// This is the native VMConnect behavior for local Hyper-V connections and avoids handling a reusable host password.
+    #[cfg(all(windows, feature = "vmconnect"))]
+    #[must_use]
+    pub fn with_vmconnect_current_user(mut self, enabled: bool) -> Self {
+        self.properties.set_vmconnect_current_user(enabled);
+        self.vmconnect_current_user = enabled;
         self
     }
 
@@ -1297,6 +1357,26 @@ impl ConfigBuilder {
             self.properties.clear_kdc_proxy_url();
         }
         self.kerberos_config = Some(cfg);
+        self
+    }
+
+    /// Set the minimum interval between non-forced input batches.
+    ///
+    /// Mouse movement is batched until this interval elapses.
+    /// Keyboard, button, wheel, synchronization, and QoE events remain immediate.
+    #[must_use]
+    pub fn with_input_send_interval(mut self, interval: Duration) -> Self {
+        self.input_send_interval = Some(interval);
+        self
+    }
+
+    /// Set the interval between synthetic input keepalive events.
+    ///
+    /// Unlike [`with_fake_events_interval`](Self::with_fake_events_interval), this does not write the minute-based `ironrdp_fakeeventsinterval` compatibility property.
+    /// When both intervals are configured, the shorter interval controls synthetic input.
+    #[must_use]
+    pub fn with_input_keepalive_interval(mut self, interval: Duration) -> Self {
+        self.input_keepalive_interval = Some(interval);
         self
     }
 
@@ -1411,6 +1491,14 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable explicit caller-supplied location redirection.
+    #[cfg(feature = "location")]
+    #[must_use]
+    pub fn with_location_redirection(mut self, enabled: bool) -> Self {
+        self.channels.location = enabled;
+        self
+    }
+
     /// Parent HWND used for WebAuthn UI prompts (Windows only).
     #[cfg(all(windows, feature = "webauthn"))]
     #[must_use]
@@ -1516,28 +1604,40 @@ impl ConfigBuilder {
     /// because [`build`](Self::build) resolves them from the RDP server account.
     pub fn missing(&self) -> Vec<MissingField> {
         let mut missing = Vec::new();
-        if self.destination.is_none() {
-            missing.push(MissingField::ServerAddress);
-        }
-        if self.username.is_none() {
-            missing.push(MissingField::Username);
-        }
-        if self.password.is_none() {
-            missing.push(MissingField::Password);
-        }
+        #[cfg(all(windows, feature = "vmconnect"))]
+        let uses_current_vmconnect_credentials = self.vm_id.is_some() && self.vmconnect_current_user;
+        #[cfg(not(all(windows, feature = "vmconnect")))]
+        let uses_current_vmconnect_credentials = false;
         #[cfg(feature = "gateway")]
-        if matches!(self.transport, TransportKind::Gateway { .. }) {
-            let uses_server_credentials = matches!(
+        let gateway_uses_server_credentials = matches!(self.transport, TransportKind::Gateway { .. })
+            && matches!(
                 self.properties.gateway_credentials_source(),
                 Ok(Some(ironrdp_cfg::GatewayCredentialsSource::UseServerCredentials))
             );
-            if !uses_server_credentials {
-                if self.gateway_username.is_none() {
-                    missing.push(MissingField::GatewayUsername);
-                }
-                if self.gateway_password.is_none() {
-                    missing.push(MissingField::GatewayPassword);
-                }
+        #[cfg(not(feature = "gateway"))]
+        let gateway_uses_server_credentials = false;
+        if self.destination.is_none() {
+            missing.push(MissingField::ServerAddress);
+        }
+        if self.username.is_none()
+            && (!uses_current_vmconnect_credentials
+                || (gateway_uses_server_credentials && self.gateway_username.is_none()))
+        {
+            missing.push(MissingField::Username);
+        }
+        if self.password.is_none()
+            && (!uses_current_vmconnect_credentials
+                || (gateway_uses_server_credentials && self.gateway_password.is_none()))
+        {
+            missing.push(MissingField::Password);
+        }
+        #[cfg(feature = "gateway")]
+        if matches!(self.transport, TransportKind::Gateway { .. }) && !gateway_uses_server_credentials {
+            if self.gateway_username.is_none() {
+                missing.push(MissingField::GatewayUsername);
+            }
+            if self.gateway_password.is_none() {
+                missing.push(MissingField::GatewayPassword);
             }
         }
         if matches!(self.transport, TransportKind::RDCleanPath { .. }) && self.rdcleanpath_token.is_none() {
@@ -1646,6 +1746,43 @@ impl ConfigBuilder {
         #[cfg(feature = "vmconnect")]
         if let Some(vm_id) = &self.vm_id {
             anyhow::ensure!(!vm_id.trim().is_empty(), "vmconnect VM ID is empty");
+        }
+
+        #[cfg(feature = "vmconnect")]
+        if self.vm_id.is_some()
+            && let Some(destination) = self.destination.as_mut()
+            && destination.name == "."
+        {
+            destination.name = "localhost".to_owned();
+            self.properties.set_full_address(&ironrdp_cfg::TargetAddr {
+                host: ironrdp_cfg::TargetHost::Domain(destination.name.clone()),
+                port: destination.port,
+            });
+            self.properties.clear_alternate_full_address();
+        }
+
+        #[cfg(all(windows, feature = "vmconnect"))]
+        if self.vm_id.is_some()
+            && self.vmconnect_current_user
+            && matches!(self.transport, TransportKind::RDCleanPath { .. })
+        {
+            anyhow::bail!("vmconnect current-user authentication is not supported with RDCleanPath");
+        }
+
+        #[cfg(all(windows, feature = "vmconnect"))]
+        let vmconnect_framebuffer_redirection = self.vm_id.is_some()
+            && matches!(&self.transport, TransportKind::Direct)
+            && self
+                .destination
+                .as_ref()
+                .is_some_and(|destination| is_loopback_host(destination.name()));
+
+        #[cfg(all(windows, feature = "vmconnect"))]
+        if vmconnect_framebuffer_redirection && self.dig_product_id.as_deref().is_none_or(str::is_empty) {
+            self.dig_product_id = Some(
+                ironrdp_vmconnect::local_instance_id()
+                    .context("read local RDP InstanceID for VMConnect frame-buffer redirection")?,
+            );
         }
 
         #[cfg(feature = "vmconnect")]
@@ -1821,6 +1958,7 @@ impl ConfigBuilder {
             request_data: None,
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,
+            support_dyn_vc_gfx_protocol: false,
             compression_type,
             performance_flags: self.performance_flags.unwrap_or_default(),
             timezone_info: TimezoneInfo::default(),
@@ -1860,13 +1998,19 @@ impl ConfigBuilder {
             connector,
             destination: self.destination.context("server address is required")?,
             transport,
+            #[cfg(feature = "udp")]
+            udp_transport_enabled: self.udp_transport_enabled,
             certificate_validation,
             certificate_validation_callback: self.certificate_validation_callback,
             #[cfg(feature = "vmconnect")]
             vm_id: self.vm_id,
             #[cfg(feature = "vmconnect")]
             vmconnect_mode: self.vmconnect_mode,
+            #[cfg(all(windows, feature = "vmconnect"))]
+            vmconnect_current_user: self.vmconnect_current_user,
             kerberos_config,
+            input_send_interval: self.input_send_interval,
+            input_keepalive_interval: self.input_keepalive_interval,
             fake_events_interval: self.fake_events_interval,
             channels: self.channels,
             administrative_session: self.administrative_session,
@@ -1875,7 +2019,6 @@ impl ConfigBuilder {
             audio_quality_mode: self.audio_quality_mode.unwrap_or_default(),
             rail_client_status_flags: self.rail_client_status_flags,
             rail_initial_execute,
-            dirty_region_updates: self.dirty_region_updates.unwrap_or(false),
             #[cfg(feature = "dvc-pipe-proxy")]
             dvc_pipe_proxies: self.dvc_pipe_proxies,
             #[cfg(all(windows, feature = "dvc-com-plugin"))]
@@ -1965,6 +2108,22 @@ impl ConfigBuilder {
         if let Some(dir) = ps.shell_working_directory() {
             self.work_dir = Some(dir.to_owned());
         }
+        #[cfg(feature = "vmconnect")]
+        if let Some(vm_id) = ps.vmconnect_id() {
+            self.vm_id = Some(vm_id.to_owned());
+        }
+        #[cfg(feature = "vmconnect")]
+        if let Some(basic) = ps.vmconnect_basic() {
+            self.vmconnect_mode = if basic {
+                VmConnectMode::Basic
+            } else {
+                VmConnectMode::Enhanced
+            };
+        }
+        #[cfg(all(windows, feature = "vmconnect"))]
+        if let Some(current_user) = ps.vmconnect_current_user() {
+            self.vmconnect_current_user = current_user;
+        }
         if let Some(remote_application_mode) = ps.remote_application_mode() {
             self.remote_application_mode = Some(remote_application_mode);
         }
@@ -1973,6 +2132,15 @@ impl ConfigBuilder {
         }
         if let Some(minutes) = ps.fake_events_interval() {
             self.fake_events_interval = Some(Duration::from_secs(u64::from(minutes) * 60));
+        }
+        if let Some(milliseconds) = ps.get::<u32>("mininputsendinterval") {
+            if milliseconds > 2_000 {
+                anyhow::bail!("invalid minimum input send interval: valid values are 0 through 2000 milliseconds");
+            }
+            self.input_send_interval = Some(Duration::from_millis(u64::from(milliseconds)));
+        }
+        if let Some(seconds) = ps.get::<u32>("keepaliveinterval") {
+            self.input_keepalive_interval = (seconds != 0).then(|| Duration::from_secs(u64::from(seconds)));
         }
         if let Some(level) = ps.compression_level() {
             self.compression_type = Some(compression_type_from_level(level)?);
@@ -2191,6 +2359,14 @@ fn compression_type_from_level(level: u32) -> anyhow::Result<ironrdp_pdu::rdp::c
     }
 }
 
+#[cfg(all(windows, feature = "vmconnect"))]
+fn is_loopback_host(host: &str) -> bool {
+    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<core::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn level_from_compression_type(ty: ironrdp_pdu::rdp::client_info::CompressionType) -> u32 {
     use ironrdp_pdu::rdp::client_info::CompressionType;
 
@@ -2230,6 +2406,8 @@ fn kerberos_config_from_properties(
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+
     use ironrdp_cfg::PropertySetExt as _;
     use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 
@@ -2277,6 +2455,34 @@ mod tests {
             .build()
             .expect("terminator-only load-balance info clears the token");
         assert!(cleared.load_balance_info().is_none());
+    }
+
+    #[test]
+    fn input_timing_configuration_preserves_subminute_precision() {
+        let config = complete_builder()
+            .with_input_send_interval(Duration::from_millis(100))
+            .with_input_keepalive_interval(Duration::from_secs(5))
+            .build()
+            .expect("valid input timing configuration");
+
+        assert_eq!(config.input_send_interval(), Some(Duration::from_millis(100)));
+        assert_eq!(config.input_keepalive_interval(), Some(Duration::from_secs(5)));
+        assert_eq!(config.fake_events_interval(), None);
+        assert_eq!(config.properties.get::<u32>("ironrdp_fakeeventsinterval"), None);
+
+        let mut properties = ironrdp_propertyset::PropertySet::new();
+        properties.insert("mininputsendinterval", 2_000u32);
+        properties.insert("keepaliveinterval", 30u32);
+        let config = complete_builder()
+            .with_property_set(&properties)
+            .expect("valid input timing properties")
+            .build()
+            .expect("valid input timing configuration");
+        assert_eq!(config.input_send_interval(), Some(Duration::from_secs(2)));
+        assert_eq!(config.input_keepalive_interval(), Some(Duration::from_secs(30)));
+
+        properties.insert("mininputsendinterval", 2_001u32);
+        assert!(complete_builder().with_property_set(&properties).is_err());
     }
 
     #[cfg(any(feature = "sound", feature = "rdpdr"))]
